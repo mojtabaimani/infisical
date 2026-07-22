@@ -1,4 +1,7 @@
 stages:
+  - sync
+  - test
+  - promote
   - build
 
 default:
@@ -6,25 +9,208 @@ default:
 
 workflow:
   rules:
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "schedule"
     - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_TAG
 
 variables:
-  # Standalone image: frontend + backend in one container
   DOCKERFILE: Dockerfile.standalone-infisical
   INFISICAL_PLATFORM_VERSION: "custom"
+  UPSTREAM_URL: "https://github.com/Infisical/infisical.git"
+  UPSTREAM_REF: "main"
+  # Full history required for clean upstream merges
+  GIT_DEPTH: "0"
+  FF_NETWORK_PER_BUILD: "true"
 
+# ---------------------------------------------------------------------------
+# Upstream sync (schedule / manual web with SYNC_UPSTREAM=1)
+# Merges GitHub Infisical/infisical. Conflicts or lost custom markers = fail.
+# ---------------------------------------------------------------------------
+sync-upstream:
+  stage: sync
+  image: node:22-bookworm
+  resource_group: upstream-sync
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web" && $SYNC_UPSTREAM == "1"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - git remote set-url origin "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+    - git fetch origin "$CI_DEFAULT_BRANCH"
+  script:
+    - chmod +x scripts/ci/*.sh
+    - bash scripts/ci/sync-upstream.sh
+    - bash scripts/ci/verify-custom-patches.sh
+    # Persist merged history for test + promote jobs
+    - git bundle create sync.bundle HEAD "refs/heads/${CI_DEFAULT_BRANCH}"
+    - |
+      if grep -q '^SYNCED=1' .ci-sync-state; then
+        echo "Upstream changes merged; tests must pass before promote."
+      else
+        echo "Already up to date with upstream; promote will no-op push."
+      fi
+  artifacts:
+    when: on_success
+    expire_in: 1 day
+    paths:
+      - sync.bundle
+      - .ci-sync-state
+
+# Always assert custom patches on mainline pipelines too
+verify-custom-patches:
+  stage: test
+  image: node:22-bookworm
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $SYNC_UPSTREAM == "1"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - chmod +x scripts/ci/verify-custom-patches.sh
+    - bash scripts/ci/verify-custom-patches.sh
+
+# ---------------------------------------------------------------------------
+# Tests after sync (work from merged git bundle)
+# ---------------------------------------------------------------------------
+.test-from-bundle:
+  image: node:22-bookworm
+  services:
+    - docker:dind
+  variables:
+    # Match working build job networking on this cluster
+    DOCKER_HOST: tcp://localhost:2375
+    DOCKER_TLS_CERTDIR: ""
+    DB_CONNECTION_URI: "postgres://infisical:infisical@localhost:5432/infisical?sslmode=disable"
+    REDIS_URL: "redis://localhost:6379"
+    AUTH_SECRET: "ci-auth-secret-not-for-production"
+    ENCRYPTION_KEY: "f13dbc92aaaf86fa7cb0ed8ac3265f47"
+    TELEMETRY_ENABLED: "false"
+    NODE_ENV: "test"
+    LICENSE_KEY: "0689488e-4ee6-47d4-93ff-8a52eb95f824"
+  needs:
+    - job: sync-upstream
+      artifacts: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web" && $SYNC_UPSTREAM == "1"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl docker.io
+    - |
+      if ! command -v docker-compose >/dev/null 2>&1 && ! docker compose version >/dev/null 2>&1; then
+        apt-get install -y --no-install-recommends docker-compose || true
+      fi
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - rm -rf merged && git clone sync.bundle merged
+    - cd merged && git checkout "$CI_DEFAULT_BRANCH"
+    - |
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        echo "waiting for docker... ($i/30)"
+        sleep 2
+      done
+      docker info
+    - cd merged && touch .env
+    - cd merged && (docker compose -f docker-compose.dev.yml up -d db redis || docker-compose -f docker-compose.dev.yml up -d db redis)
+    - |
+      for i in $(seq 1 60); do
+        if docker compose -f merged/docker-compose.dev.yml exec -T db pg_isready -U infisical 2>/dev/null \
+          || docker-compose -f merged/docker-compose.dev.yml exec -T db pg_isready -U infisical 2>/dev/null \
+          || docker exec "$(docker ps -qf name=db)" pg_isready -U infisical 2>/dev/null; then
+          break
+        fi
+        echo "waiting for postgres... ($i/60)"
+        sleep 2
+      done
+    - cd merged/backend && npm ci --ignore-scripts
+    - cd merged/backend && npm rebuild bcrypt argon2 2>/dev/null || true
+    - |
+      if ! node -e "require('re2')" 2>/dev/null; then
+        printf '%s\n' '"use strict";class RE2 extends RegExp{replace(s,r){return String(s).replace(this,r)}}module.exports=RE2;module.exports.default=RE2;' \
+          > merged/backend/node_modules/re2/re2.js
+      fi
+
+test-unit-after-sync:
+  extends: .test-from-bundle
+  stage: test
+  script:
+    - bash merged/scripts/ci/verify-custom-patches.sh
+    - cd merged/backend && npm run test:unit -- src/ee/services/license/license-custom.test.ts
+    - cd merged/backend && npm run test:unit
+
+test-e2e-after-sync:
+  extends: .test-from-bundle
+  stage: test
+  needs:
+    - job: sync-upstream
+      artifacts: true
+    - job: test-unit-after-sync
+  script:
+    - bash merged/scripts/ci/verify-custom-patches.sh
+    - cd merged/backend && npm run migration:latest-dev
+    - |
+      cd merged/backend
+      # Focused license gate + broader e2e suite. Bail on first failure.
+      npm run test:e2e -- e2e-test/routes/v1/org.spec.ts || npm run test:e2e
+
+# ---------------------------------------------------------------------------
+# Promote merged commit to main only after tests pass
+# ---------------------------------------------------------------------------
+promote-upstream-sync:
+  stage: promote
+  image: node:22-bookworm
+  resource_group: upstream-sync
+  needs:
+    - job: sync-upstream
+      artifacts: true
+    - job: test-unit-after-sync
+    - job: test-e2e-after-sync
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web" && $SYNC_UPSTREAM == "1"
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+  script:
+    - |
+      set -euo pipefail
+      source .ci-sync-state
+      if [[ "${SYNCED}" != "1" ]]; then
+        echo "No upstream changes to promote."
+        exit 0
+      fi
+      rm -rf merged && git clone sync.bundle merged
+      cd merged
+      git checkout "$CI_DEFAULT_BRANCH"
+      bash scripts/ci/verify-custom-patches.sh
+      git remote add gitlab "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
+      echo "Pushing merged commit ${AFTER_SHA} to ${CI_DEFAULT_BRANCH}"
+      git push gitlab "HEAD:refs/heads/${CI_DEFAULT_BRANCH}"
+      echo "Promoted successfully."
+
+# ---------------------------------------------------------------------------
+# Image build (main branch pushes / tags / manual web without sync)
+# ---------------------------------------------------------------------------
 build-docker-image:
   stage: build
   image: docker:cli
   services:
     - docker:dind
   variables:
-    # Kubernetes executor: dind is reachable via localhost
     DOCKER_HOST: tcp://localhost:2375
     DOCKER_TLS_CERTDIR: ""
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "web" && $SYNC_UPSTREAM == "1"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
   before_script:
     - |
       for i in $(seq 1 30); do
@@ -35,6 +221,7 @@ build-docker-image:
       docker info
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
   script:
+    - bash scripts/ci/verify-custom-patches.sh
     - |
       docker build \
         --provenance=false \
@@ -47,7 +234,3 @@ build-docker-image:
     - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
     - echo "Pushed $CI_REGISTRY_IMAGE:latest"
     - echo "Pushed $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
-  rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
-    - if: $CI_COMMIT_TAG
-    - if: $CI_PIPELINE_SOURCE == "web"
