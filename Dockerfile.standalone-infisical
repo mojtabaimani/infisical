@@ -178,6 +178,7 @@ RUN mkdir frontend-build
 FROM base AS production
 
 # Runtime dependencies + build tools needed for PQC OpenSSL build
+# Infisical CLI apt repo is often unreachable from restricted networks; keep it optional.
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     bash \
@@ -192,8 +193,9 @@ RUN apt-get update && apt-get install -y \
     openssh-client \
     libaio1t64 \
     smbclient \
-    && curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
-    && apt-get update && apt-get install -y infisical=0.43.90 \
+    && (curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
+        && apt-get update && apt-get install -y infisical=0.43.90 \
+        || echo "WARNING: skipping Infisical CLI install (repo unreachable)") \
     # Patch CVEs in base image packages (pinned versions for reproducibility)
     && apt-get install -y --only-upgrade \
     libgnutls30t64=3.8.9-3+deb13u4 \
