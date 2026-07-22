@@ -1,0 +1,53 @@
+stages:
+  - build
+
+default:
+  interruptible: true
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+variables:
+  # Standalone image: frontend + backend in one container
+  DOCKERFILE: Dockerfile.standalone-infisical
+  INFISICAL_PLATFORM_VERSION: "custom"
+
+build-docker-image:
+  stage: build
+  image: docker:cli
+  services:
+    - docker:dind
+  variables:
+    # Kubernetes executor: dind is reachable via localhost
+    DOCKER_HOST: tcp://localhost:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - |
+      for i in $(seq 1 30); do
+        docker info >/dev/null 2>&1 && break
+        echo "waiting for docker daemon... ($i/30)"
+        sleep 2
+      done
+      docker info
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - |
+      docker build \
+        --provenance=false \
+        -f "$DOCKERFILE" \
+        --build-arg "INFISICAL_PLATFORM_VERSION=${INFISICAL_PLATFORM_VERSION}-${CI_COMMIT_SHORT_SHA}" \
+        -t "$CI_REGISTRY_IMAGE:latest" \
+        -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" \
+        .
+    - docker push "$CI_REGISTRY_IMAGE:latest"
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - echo "Pushed $CI_REGISTRY_IMAGE:latest"
+    - echo "Pushed $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+    - if: $CI_PIPELINE_SOURCE == "web"
