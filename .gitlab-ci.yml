@@ -220,6 +220,8 @@ build-docker-image:
       done
       docker info
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    # docker:cli is Alpine — install bash for verify-custom-patches.sh
+    - apk add --no-cache bash >/dev/null
   script:
     - bash scripts/ci/verify-custom-patches.sh
     - |
