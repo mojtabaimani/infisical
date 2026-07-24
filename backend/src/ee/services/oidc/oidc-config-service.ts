@@ -796,7 +796,7 @@ export const oidcConfigServiceFactory = ({
         client,
         passReqToCallback: true,
         usePKCE: supportsPKCE,
-        params: { prompt: "login", ...(supportsPKCE ? { code_challenge_method: "S256" } : {}) }
+        params: { ...(supportsPKCE ? { code_challenge_method: "S256" } : {}) }
       },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (_req: any, tokenSet: TokenSet, cb: any) => {

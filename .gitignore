@@ -81,3 +81,7 @@ __pycache__
 dump.rdb
 **/dump.rdb
 
+
+# Fork offline-license private key (never commit)
+custom/license/offline_license_private_key.pem
+

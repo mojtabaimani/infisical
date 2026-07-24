@@ -74,4 +74,22 @@ need_grep "Dockerfile.standalone-infisical" \
 need_grep ".gitlab-ci.yml" 'sync-upstream' "upstream sync job"
 need_grep ".gitlab-ci.yml" 'verify-custom-patches' "custom patch gate"
 
+# OIDC must not force IdP re-auth on every login
+need_file "backend/src/ee/services/oidc/oidc-config-service.ts"
+if grep -qE 'prompt:\s*"login"' backend/src/ee/services/oidc/oidc-config-service.ts; then
+  fail "OIDC strategy must not set prompt: \"login\" (forces double IdP login)"
+fi
+need_grep "backend/src/ee/services/oidc/oidc-config-service.ts" \
+  'code_challenge_method: "S256"' \
+  "PKCE must remain enabled"
+
+# Offline license (no portal.infisical.com)
+need_file "custom/license/LICENSE_KEY_OFFLINE.b64"
+need_file "custom/license/offline_license_public_key.pem"
+need_file "backend/src/lib/crypto/license_public_key.pem"
+# Public keys must match so offline blob verifies
+if ! cmp -s custom/license/offline_license_public_key.pem backend/src/lib/crypto/license_public_key.pem; then
+  fail "license_public_key.pem must match custom/license/offline_license_public_key.pem"
+fi
+
 echo "==> All custom patch checks passed"
