@@ -203,6 +203,9 @@ build-docker-image:
   variables:
     DOCKER_HOST: tcp://localhost:2375
     DOCKER_TLS_CERTDIR: ""
+    # Keep job log under GitLab's 4MiB cap — vite/rollup warnings alone blow it
+    # and the runner can lose the real exit status after truncation.
+    BUILDKIT_PROGRESS: "plain"
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
       when: never
@@ -225,14 +228,31 @@ build-docker-image:
   script:
     - bash scripts/ci/verify-custom-patches.sh
     - |
-      docker build \
+      set -euo pipefail
+      echo "Building $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA ..."
+      # Redirect full build output — frontend emits MBs of circular-dep warnings.
+      if ! docker build \
         --provenance=false \
         -f "$DOCKERFILE" \
         --build-arg "INFISICAL_PLATFORM_VERSION=${INFISICAL_PLATFORM_VERSION}-${CI_COMMIT_SHORT_SHA}" \
         -t "$CI_REGISTRY_IMAGE:latest" \
         -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" \
-        .
-    - docker push "$CI_REGISTRY_IMAGE:latest"
-    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
-    - echo "Pushed $CI_REGISTRY_IMAGE:latest"
-    - echo "Pushed $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+        . > /tmp/docker-build.log 2>&1
+      then
+        echo "ERROR: docker build failed; last 80 lines:"
+        tail -n 80 /tmp/docker-build.log
+        exit 1
+      fi
+      echo "Build OK. Last 20 lines:"
+      tail -n 20 /tmp/docker-build.log
+    - |
+      set -euo pipefail
+      echo "Pushing $CI_REGISTRY_IMAGE:latest"
+      docker push "$CI_REGISTRY_IMAGE:latest"
+      echo "Pushing $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+      docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+      echo "Verifying remote tags..."
+      docker buildx imagetools inspect "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" >/tmp/inspect.out
+      head -n 20 /tmp/inspect.out
+      echo "Pushed $CI_REGISTRY_IMAGE:latest"
+      echo "Pushed $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
